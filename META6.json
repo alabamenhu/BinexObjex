@@ -1,0 +1,19 @@
+{
+  "name": "Binex/Objex",
+  "description": "A binary- and object-based pattern matching solution for Raku",
+  "version": "0.1.0",
+  "perl": "6.*",
+  "auth": "Matthew ‘Matéu’ Stephen Stuckwisch",
+  "depends": [],
+  "build-depends": [],
+  "test-depends": [],
+  "provides": {
+    "Binex": "lib/Binex.rakumod",
+    "Binex::Actions": "lib/Binex/Actions.rakumod",
+    "Binex::Classes": "lib/Binex/Classes.rakumod",
+    "Binex::Grammar": "lib/Binex/Grammar.rakumod"
+  },
+  "resources": [],
+  "license": "Artistic-2.0",
+  "source-url": "https://github.com/alabamenhu/BinexObjex.git"
+}
