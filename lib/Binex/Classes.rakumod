@@ -3,16 +3,54 @@
 # todo convert this to a capture
 class BXMatch is Positional is Associative {
     has Blob $.orig;
-    has int  $.from;
-    has int  $.to;
-    has int  $.pos;
-    has      @.positional = Empty; # can be a list OR a BinexMatch
-    has      %.named      = Empty; # can be a list OR a BinexMatch
+    has int  $.from = 0;
+    has int  $.to is rw = $!from ;
+    has int  $.pos is rw = $!from;
+    has      @.positional; # can be a list OR a BinexMatch
+    has      %.named;      # can be a list OR a BinexMatch
     method scoured { False }
-    multi method gist (BXMatch:D:) { 'BXMatch[' ~ $!from ~ '…' ~ $!to ~ ']' }
+    multi method gist (BXMatch:D:) {
+        "BXMatch"
+                ~ "\x001b[38;5;242m" ~ "[" ~ "\x001b[0m"
+                ~ $!from
+                ~ "\x001b[38;5;242m" ~ "…" ~ "\x001b[0m"
+                ~ $!to
+                ~ "\x001b[38;5;242m" ~ "@" ~ "\x001b[0m"
+                ~ "\x001b[34m" ~ $!pos ~ "\x001b[0m"
+                ~ "\x001b[38;5;242m" ~ "]" ~ "\x001b[0m"
+    }
     method Blob { $!orig.subbuf: $!from, $!to }
     method list { @!positional }
     method hash { %!named      }
+    method add_named (\match, \name, :$force-array) {
+        if %!named{name} {
+            if %!named{name}.isa(BXMatch) {
+                %!named{name} := Array.new: %!named{name},match
+            } else {
+                %!named{name}.push: match
+            }
+        } else {
+            %!named{name} := $force-array ?? match !! Array.new(match)
+        }
+    }
+    method add_positional (\match, \pos = @!positional.elems, :$force-array = False) {
+        if @!positional[pos]:exists {
+            if @!positional[pos].isa(BXMatch) {
+                @!positional[pos] := Array.new: @!positional[pos],match
+            }else{
+                @!positional.push: match
+            }
+        } else {
+            if $force-array {
+                #say "Adding a match we've never seen before, single item as array";
+                @!positional[pos] := Array.new: match
+            } else {
+                #say "Adding a match we've never seen before, single item";
+                @!positional[pos] := match
+            }
+        }
+    }
+
 }
 subset BXMatchResult where BXMatch | Slip;
 
@@ -37,22 +75,32 @@ role Binex {
                 ?? 3
                 !! 1;
 
-        my \match = self.MATCH(orig, 0, orig.elems);
+        # Init some values before matching
+        my $*BX-QUANTIFIED = False;
+        my $*BX-CAPTURE    := (self.scoured ?? BXMatchScoured !! BXMatch).new(orig => orig,:0from);
+        $¢ = $*BX-CAPTURE; # this should propogate down the caller chain, but it doesn't.
+
+        my \result = self.MATCH(orig, 0, orig.elems);
+
+        # The original $/ may be two or three callers up, depending on
+        # whether it was called with ~~ or .ACCEPTS directly.
         if Backtrace.new($skip-frames).list.head.subname eq 'infix:<~~>' {
-            $CALLER::CALLER::CALLER::('/') = match;
+            $CALLER::CALLER::CALLER::('/') = result;
         }else{
-            $CALLER::CALLER::('/') = match;
+            $CALLER::CALLER::('/') = result;
         }
-        return match
+
+        return result
     }
     proto method MATCH($, int $, int $? --> BXMatch) { * }
-    # ^^ MATCH can always assume a *BX-CTX variable
+    # ^^ MATCH can always assume a *BX-CAPTURE variable
 }
 
 
 
 class BXLiteral {...}
 class BXQuant {...}
+class BXDynQuant {...}
 # These roles require their attributes to be rw
 # This is due to the fact (bug?) that native types are considered immutable
 # even when referenced with $!foo.
@@ -77,7 +125,7 @@ role BXType[8] {
         }
         $!mask = +^$!mask;
     }
-    method MATCH(Blob \orig, int \from, $) {
+    method MATCH(Blob \orig, int \from) {
         # This is kind of silly, but the assignment is necessary to avoid unboxing
         my uint8 $filter = $!mask +& (orig[from] +^ $!match);
         return Nil unless $filter == 0;
@@ -111,9 +159,9 @@ role BXScouredType[8] {
         $!mask = +^$!mask;
         $!zero = +^$!zero;
     }
-    method MATCH(Blob \orig, int \from, $ #`[would be $to, but on lit doesn't matter] ) {
+    method MATCH(Blob \orig, int \from) {
         return Nil if $!mask +& (orig[from] +^ $!match);
-        BXMatchScoured.new: :orig(orig), :from(from), :to(from + 1),
+        BXMatchScoured.new: :orig(orig), :from(from), :to(from + 1), :pos(from + 1),
                             :scoured-blob(blob8.new: orig[from] +& $!zero +> $!rshift)
     }
 }
@@ -162,81 +210,141 @@ class BXConcat does Binex {
 
     multi method gist { 'BXConcat' }
     multi method MATCH(Blob \orig, \from = 0, \to = orig.elems --> BXMatch) {
-        my $pos = from;
-        # Scoured needs to be handled separately
-        # so that we don't slow down regular matches
+        my \match = ($.scoured ?? BXMatchScoured !! BXMatch).new:
+                orig => orig,
+                from => from,
+                pos => from;
+
+        my $*BX-CAPTURE = $CALLERS::('*BX-CAPTURE') // match;
+        # Scoured requires regularly concatenating a blob
+        # so it's avoided in regular matches.
+        # These subs will restore old pos/to values
         if $.scoured {
-            my @matches;
-            for @!children -> \child {
-                my $match := child.MATCH(orig, $pos, to);
-                return Nil unless $match;
-                @matches.push: $match;
-                $pos = $match.to;
-            }
-            return BXMatchScoured.new:
-                    orig => orig,
-                    from => from,
-                    to => $pos,
-                    scoured-blob => [~] @matches>>.Blob;
+            #my $scoured-blob := match.scoured-blob;
+            return match if self!step-scoured(0,match);
+            return Nil;
         } else {
-            my \matches = self!step(0, orig, from, to);
-            return Nil unless matches;
-            return BXMatch.new: orig => orig, from => from, to => matches.tail.to;
+            return match if self!step(0,match);
+            return Nil
         }
     }
 
-    method !step(\index, Blob \orig, int \from, int \to) {
-        # The logic of this is fairly simple.
-        # Each child node is processed.  If it's a non-ratcheting quant
-        # then we set a first run to 0, and then reattempt the match with
-        # quant until there's a successful match chain, or the possibilities
-        # are exhausted.
+    method !step(\index, \match) {
+        # This is a recursive method.  DO NOT CHANGE WITHOUT ALSO CHANGING SCOURED
+        # The "to" attribute is only set when the match is made.
+        # A match is successful if we reach this point (the end of the chain).
+        if index == @!children.elems {
+            match.to = match.pos;
+            return True;
+        }
 
-        return Empty if index == @!children.elems;
+        my \child := @!children[index];
+
+        child.set_min_max if child.isa(BXDynQuant);
+
+        # determine if we need to allow back tracking
+        # If we are the final element, ratching is on, or it's not a quant, we don't
+        if child.isa(BXQuant) && !child.ratcheting && (index + 1 != @!children.elems) {
+            my $*last-quant;
+
+            # Each iteration will [in|de]crement the match count via $*last-quant,
+            # which is reset in the BXQuant Match method.
+            # Backtracking exhausted when Nil
+            while my \current := child.MATCH(match.orig, match.pos) {
+                # If it matches, check and see if the rest of the concat works
+                my $old-pos = match.pos;
+                match.pos = current.to;
+                my \end := self!step(index+1,match);
+
+                # End is True if the rest of the the trail matched
+                if end {
+                    return True;
+                } else {
+                    # Restore old POS, because we're just passing around the original
+                    match.pos = $old-pos
+                }
+            }
+            # We only reach this point if all attempts to get a valid
+            # match with the quantified atom fail, so we return Nil.
+            return False;
+
+        } else {
+            # If quants ratchet or is final, then it runs once with default settings
+            my $*last-quant;
+            my \current := child.MATCH(match.orig, match.pos);
+            return False unless current;
+
+            # Match forward
+            match.pos = current.to;
+            my \end := self!step(index+1, match);
+            return end;
+        }
+    }
+
+    method !step-scoured(\index, \match) {
+        # This is a recursive method.  THIS METHOD SHOULD BE IDENTICAL TO !STEP
+        #   except that it also regularly updates the blob which requires more
+        #   resource allocation.
+        # The "to" attribute is only set when the match is made.
+        # A match is successful if we reach this point (the end of the chain).
+        if index == @!children.elems {
+            match.to = match.pos;
+            return True;
+        }
+
         my \child := @!children[index];
 
         # determine if we need to allow back tracking
         # If we are the final element, ratching is on, or it's not a quant, we don't
         if child.isa(BXQuant) && !child.ratcheting && (index + 1 != @!children.elems) {
             my $*last-quant;
-            # each iteration will [in|de]crement the match count.
-            # exhausted when Nil
-            while my \match := child.MATCH(orig, from, to) {
+            # Each iteration will [in|de]crement the match count via $*last-quant,
+            # which is reset in the BXQuant Match method.
+            # Backtracking exhausted when Nil
+            while my \current := child.MATCH(match.orig, match.pos) {
+                # If it matches, check and see if the rest of the concat works
+                my $old-pos  = match.pos;
+                my $old-blob = match.scoured-blob;
+                match.pos           = current.to;
+                match.scoured-blob ~= current.scoured-blob;
 
-                # if it matches, check and see if the rest of the concat works
-                my \rest = self!step(index+1,orig,match.to, to);
+                my \end := self!step(index+1,match);
 
-                # if not, bail
-                next unless rest; # use Nil, because Empty is falsy
-                # success, so return it
-                return match, |rest;
+                # End is True if the rest of the the trail matched
+                if end {
+                    return True;
+                } else {
+                    # Restore old POS, because we're just passing around the original
+                    match.pos          = $old-pos;
+                    match.scoured-blob = $old-blob;
+                }
             }
-            # bail because we exhausted
-            return Nil;
+            # We only reach this point if all attempts to get a valid
+            # match with the quantified atom fail, so we return Nil.
+            return False;
+
         } else {
             # If quants ratchet or is final, then it runs once with default settings
             my $*last-quant;
-            my \match := child.MATCH(orig, from, to);
-            return Nil unless match;
+            my \current := child.MATCH(match.orig, match.pos);
+            return False unless current;
 
-            # We are the tail, so return now
-            return (match,) if index + 1 == @!children.elems;
+            # Match forward
+            match.pos          = current.to;
+            match.scoured-blob = current.scoured-blob;
 
-            # Still more, so check it
-            my \rest := self!step(index+1, orig, match.to, to);
-            return Nil unless rest;
-
-            # merge and return (todo: maybe dyn variable?)
-            return match, |rest;
+            # --> True (OK) / False (failed match)
+            return self!step(index+1, match);
         }
     }
+
 }
 
 # wonderfully, here we don't have to worry about
 # the bitness
 class BXQuant does Binex {
-    has int $.min;
-    has int $.max; #-1 = inf
+    has int $.min is rw;
+    has int $.max is rw; #-1 = inf
     has @.children;
     has $.greedy = True;
     has $.ratcheting = False;
@@ -244,7 +352,7 @@ class BXQuant does Binex {
     multi method gist (BXQuant:D:) { 'BXQuant[' ~ $!min ~ '…' ~ $!max ~ (':' if $!ratcheting) ~ ('?' unless $!greedy) ~ ('X' if $.scoured) ~ ']'}
     multi method gist (BXQuant:U:) { 'BXQuant' }
 
-    multi method MATCH(Blob \orig, \from = 0, \to = orig.elems --> BXMatchResult) {
+    multi method MATCH(Blob \orig, \from = 0 --> BXMatchResult) {
         my $goal  := $*last-quant
                       ?? $!greedy
                           ?? ($*last-quant - 1)
@@ -259,6 +367,7 @@ class BXQuant does Binex {
         return Nil if $goal > $!max && $!max != -1;
 
         my $pos   = from;
+        my \to    = orig.elems; # fix, but at the moment, establishes a max pos
         my $found = 0;
         # Only make a new match context if there isn't one.
         # This should be made already by outer capture groups.
@@ -272,7 +381,7 @@ class BXQuant does Binex {
 
         my @matches;
         my \a = @!children[0];
-        @matches[0] := a.MATCH(orig, $pos, to);
+        @matches[0] := a.MATCH(orig, $pos);
         $found++;
 
         # If it doesn't match, we can still "match" if it's not required
@@ -290,9 +399,9 @@ class BXQuant does Binex {
 
         # Check if we have a separator
         if my \b := @!children[1] {
-            say "There is a separator!";
+
             while (my \sep := b.MATCH: orig, $pos, to)
-               && (to != ($pos = sep.to))
+               && (to != ($pos = sep.to) !>= orig.elems)
                && (my \cor := a.MATCH: orig, sep.to, to)
                && (@matches.elems != $goal) {
 
@@ -304,7 +413,7 @@ class BXQuant does Binex {
             }
         }else{
             # no separator
-            while $found != $goal && (my \match := a.MATCH(orig, $pos, to)) {
+            while $found != $goal && (my \match := a.MATCH(orig, $pos)) {
                 @matches.push: match;
                 $pos = match.to;
                 last if $pos == to;
@@ -342,6 +451,7 @@ class BXConjSeq does Binex {
         }
     }
 }
+
 class BXConj does Binex {
     has @.children;
     multi method gist(BXConj:D:) { 'BXConj·' ~ @!children.elems }
@@ -402,57 +512,72 @@ class BXProtoIndicator does Binex {
     }
 }
 
-class BXCapture is BXConcat {
-    has $.name = '';
-    has $.position = '';
-    method MATCH(\orig, \from, \to) {
-        {
-            my $*BX-CAPTURE = Match.new(orig, from, to);
-
-            my \match = samewith(orig, from, to);
-            return Nil unless match;
-
-            match.positional = $*BX-CAPTURE.positional;
-            match.named      = $*BX-CAPTURE.named;
-        }
-        if $!name eq '' {
-            $*BX-CAPTURE.add_positional
-        }
+class BXCodeBlock is Binex {
+    has $.code = "";
+    method EVAL {
+        use MONKEY-SEE-NO-EVAL;
+        # This activates $/, and the newline ensures ends lining in comments are correctly parsed
+        ('$/ = $*BX-CONTEXT; { ' ~ $!code ~ "\n } ").EVAL
+    }
+    method gist { 'BXCodeBlock{' ~ .code ~ '}' }
+    method Str { $!code }
+    method MATCH(\orig, \from) {
+        return BXMatch.new: orig => orig, from => from, to => from;
     }
 }
 
-class BXCaptureContext {
-    has @!positional;
-    has %!named;
-    method add_named (\match, \name, :$force-array) {
-        if %!named{name} {
-            if %!named{name}.isa(BXMatch) {
-                %!named{name} := Array.new: %!named{name},match
-            } else {
-                %!named{name}.push: match
-            }
+class BXDynQuant is BXQuant {
+    has $.codeblock;
+    method gist { 'BXDynQuant{' ~ $!codeblock.Str ~ '}' }
+    method set_min_max {
+        my $range = $!codeblock.EVAL;
+        if $range ~~ Range {
+            ($.min, $.max) = $range.int-bounds;
+            die "Can't use a negative index" if $.min < 0;
+            $.max = -1 if $.max ~~ Inf;
         } else {
-            %!named{name} := $force-array ?? match !! Array.new(match)
+            $.min = $.max = $range.Int;
         }
     }
-    method add_positional (\match, \pos = @!positional.elems, :$force-array) {
-        if @!positional[pos] {
-            if @!positional[pos].isa(BXMatch) {
-                @!positional[pos] := Array.new: @!positional[pos],match
-            }else{
-                @!positional.push: match
-            }
-        } else {
-            if $force-array {
-                @!positional[pos] := Array.new: match
-            } else {
-                @!positional[pos] := match
-            }
-        }
+}
+class BXCapture is BXConcat {
+    has $.name             = '';
+    has $.position   is rw = -1;
+    has $.force-list       = False;
+    method gist {
+        'BXCapture'
+                ~ "\x001b[32m"
+                ~ ($!name ne ''
+                    ?? "<$!name>"
+                    !! ($!position > -1
+                        ?? "[$!position]"
+                        !! "[?]"))
+                ~ "\x001b[0m"
     }
-    method list { @!positional }
-    method hash { @!positional }}
 
+    method MATCH(\orig, \from, \to = orig.elems) {
+
+        # Save the outer context, if it exists
+        my \outer := $CALLERS::('*BX-CAPTURE') // Match.new(orig => orig, from => from, to => to);
+
+        # Kill the current context, so that concat
+        # creates a new capturing context
+        my $*BX-CAPTURE = Nil;
+
+        return Nil
+            unless my \match = self.BXConcat::MATCH: orig, from, to;
+
+        # TODO: better determine if we're in a quant
+        #       ... maybe via a $*BX-QUANTIFIED var that gets reset above?
+        if $!name {
+            outer.add_named: match;
+        } else {
+            outer.add_positional: match;
+        }
+
+        return match;
+    }
+}
 
 class BXLiteralBlob does Binex {
 
@@ -472,42 +597,17 @@ class BXLiteralBlob does Binex {
     }>>>
 
 
-
-
-
 sub as-bin(byte \b) { b == 0 ?? '0b00000000' !! sprintf("%#.8b",b) }
 sub as-oct(byte \b) { b == 0 ?? '0o0000'     !! sprintf("%#.4o",b) }
 sub as-hex(byte \b) { b == 0 ?? '0x00'       !! sprintf("%#.2x",b) }
 
-multi sub dump(BXLiteral $b, $indent = 0) is export {
-    say (' ' x $indent) ~ $b.gist;
-}
-multi sub dump(BXAnchor $b, $indent = 0) is export {
-    say (' ' x $indent) ~ $b.gist;
-}
-multi sub dump(BXQuant $b, $indent = 0) is export  {
-    say (' ' x $indent) ~ $b.gist;
-    dump($_, $indent + 2) for $b.children;
-}
-multi sub dump(BXAlt $b, $indent = 0) is export  {
-    say (' ' x $indent) ~ $b.gist;
-    dump($_, $indent + 2) for $b.children;
-}
-multi sub dump(BXAltSeq $b, $indent = 0) is export  {
-    say (' ' x $indent) ~ $b.gist;
-    dump($_, $indent + 2) for $b.children;
-}
-multi sub dump(BXConjSeq $b, $indent = 0) is export  {
-    say (' ' x $indent) ~ $b.gist;
-    dump($_, $indent + 2) for $b.children;
-}
-multi sub dump(BXConj $b, $indent = 0) is export  {
-    say (' ' x $indent) ~ $b.gist;
-    dump($_, $indent + 2) for $b.children;
-}
+subset BXEndNode of Binex where .isa(BXLiteral) || .isa(BXCodeBlock) || .isa(BXAnchor);
+subset BXParentNode of Binex where !.isa(BXLiteral) || !.isa(BXCodeBlock) || !.isa(BXAnchor);
 
-multi sub dump(BXConcat $b, $indent = 0) is export  {
+multi sub dump(BXEndNode $b, $indent = 0) is export {
+    say (' ' x $indent) ~ $b.gist;
+}
+multi sub dump(BXParentNode $b, $indent = 0) is export  {
     say (' ' x $indent) ~ $b.gist;
     dump($_, $indent + 2) for $b.children;
 }
-

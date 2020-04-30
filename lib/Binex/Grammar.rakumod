@@ -95,7 +95,9 @@ unit grammar BinexGrammar;
         #:my %*BX;
         #:my $handle := '__QREGEX_BINEX__' ~ $cur_handle++;
         #:my $*W := QRegex::P6Regex::World.new(:$handle);
-
+        :my $*BX-QUANTIFIED = False; # this is enabled when entering quantifiers,
+                                     # and disabled when entering a new capture context
+                                     # It allows us to define from the get go
         <nibbler>
         [ $ || <.throw_confused> ]
     }
@@ -198,6 +200,7 @@ unit grammar BinexGrammar;
             | <!bxstopper> <quantifier>
             | <?[:]> <backmod> <!alnum>
             ]
+            # Variable definition could include %foo, so must be excluded
             [ <!{$*VARDEF}> #`«« <.SIGOK> <sigfinal=.sigmaybe> »» ]?
             [ <.ws> <separator> ]?
         ||  [ <!{$*VARDEF}> #`«« <sigfinal=.sigmaybe> »»  ]?
@@ -209,7 +212,6 @@ unit grammar BinexGrammar;
     # BINEX MODIFICATION NOTE:
     # Nothing should need to be adjusted here
     rule separator {
-        { say "Exploring a separator" }
         $<septype>=['%''%'?]
         :my $*VARDEF := 0;
         #:my $*SIGOK  := 0;
@@ -291,7 +293,8 @@ unit grammar BinexGrammar;
     # BINEX MODIFICATION NOTE:
     # This token is fine and can be used as is
     token codeblock {
-        <block=.LANG('MAIN','pblock')>
+        '{{ ' $<block>=.*? ' }}'
+        #$<block>={say $?LANG; $*LANG<MAIN><pblock>}
     }
 
     # BINEX MODIFICATION NOTE:
@@ -309,7 +312,7 @@ unit grammar BinexGrammar;
     # 7. TODO reconsider <mod>?
     proto token metachar { <...> }
     token metachar:sym<[ ]> { '[' ~ ']' <nibbler> #`(<.SIGOK>) }
-    token metachar:sym<( )> { '(' ~ ')' <nibbler> <.SIGOK> }
+    token metachar:sym<( )> { '(' ~ ')' <nibbler> #`(<.SIGOK>) }
 #    token metachar:sym<'> { <?['‘‚]> <quote_EXPR: ':q'>  <.SIGOK> }
 #    token metachar:sym<"> { <?["“„]> <quote_EXPR: ':qq'> <.SIGOK> }
 #    token metachar:sym<.> { <sym> <.SIGOK> }
@@ -347,9 +350,9 @@ unit grammar BinexGrammar;
     }
 
     # BINEX MODIFICATION NOTE:
-    # This token is fine and can be used as is
+    # This token is fine and can be used as is, but ignore SIGOK
     token metachar:sym<assert> {
-        '<' ~ '>' <assertion> <.SIGOK>
+        '<' ~ '>' <assertion> #`(<.SIGOK>)
     }
 
     # BINEX MODIFICATION NOTE:
@@ -366,10 +369,10 @@ unit grammar BinexGrammar;
         ]
 
         [
-        <.ws> '=' <.ws>
-        { $*VARDEF := 1 }
-        <quantified_atom>
-        { $*VARDEF := 0 }
+            <.ws> '=' <.ws>
+            { $*VARDEF := 1 }
+            <quantified_atom>
+            { $*VARDEF := 0 }
         ]**0..1
         <.SIGOK>
     }

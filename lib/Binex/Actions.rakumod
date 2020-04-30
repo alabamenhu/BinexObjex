@@ -2,6 +2,17 @@
 unit class BinexActions;
 use Binex::Classes;
 
+method metachar:sym<( )> ($/) {
+    my $qast := $<nibbler>.made;
+
+    if $qast.isa(BXConcat) {
+        $qast := BXCapture.new(:children($qast.children) );
+    }else{
+        $qast := BXCapture.new( :node($qast.node), :children($qast) );
+    }
+
+    make $qast;
+}
 
 method metachar:sym<[ ]> ($/) {
     my $qast := $<nibbler>.made;
@@ -11,6 +22,9 @@ method metachar:sym<[ ]> ($/) {
 
 method TOP ($/) {
     my $qast := $<nibbler>.made;
+    # Once finalized, check the positional elements.
+    # I'm not sure how regular regex does this, but this is simple enough
+    walk-pos $qast;
     make $qast;
 }
 method nibbler ($/) {
@@ -105,6 +119,51 @@ method quantifier:sym<?>($/) {
 }
 
 
+method codeblock ($/) {
+    my $qast := BXCodeBlock.new(:code($<block>.Str), :node($/));
+    make $qast;
+}
+
+method quantifier:sym<**>($/) {
+    my $qast;
+    if $<codeblock> {
+        $qast = BXDynQuant.new( :codeblock($<codeblock>.made), :node($/) );
+        #`<<< Normally, we would grab the Raku parse tree and put it directly here.
+              That's not possible in module space, so instad we hack the above
+        $qast := QAST::Regex.new( :rxtype<dynquant>, :node($/),
+                QAST::Op.new( :op('callmethod'), :name('!DYNQUANT_LIMITS'),
+                        QAST::Var.new( :name('$¢'), :scope('lexical') ),
+                        $<codeblock>.ast
+                        ),
+                );
+        >>>
+    }
+    else {
+        my $min := 0;
+        if $<min> { $min := $<min>.parse-base(10) }
+
+        my $max := -1;
+        #my $upto := $<upto>;
+
+        if $<from> eq '^' { ++$min }
+
+        if ! $<max> {
+            $max := $min
+        }
+        elsif $<max> ne '*' {
+            $max := $<max>.parse-base(10);
+            if $<upto> eq '^' {
+                --$max;
+            }
+            $/.panic("Empty range") if $min > $max;
+        }
+        $qast := QAST::Binex.new( :rxtype<quant>, :min($min), :max($max), :node($/) );
+    }
+    make $qast;
+    #make backmod($qast, $<backmod>);
+}
+
+
 method quantified_atom($/) {
     my $qast := $<atom>.made;
 
@@ -183,4 +242,69 @@ method metachar:sym<{*}> ($/) {
 
 method separator ($/) {
     make $<quantified_atom>.ast;
+}
+
+
+
+method metachar:sym<var>($/) {
+    my $qast;
+    # Is it a named match or a numeric match?
+    my $name := $<pos> ?? $<pos>.parse-base(10) !! ~$<name>;
+
+
+    if $<quantified_atom> {
+        $qast := $<quantified_atom>[0].ast;
+        if ($qast.rxtype eq 'quant' || $qast.rxtype eq 'dynquant') && $qast[0].rxtype eq 'subrule' {
+            self.subrule_alias($qast[0], $name);
+        }
+        elsif $qast.rxtype eq 'subrule' {
+            self.subrule_alias($qast, $name);
+            $qast := QAST::Regex.new( :rxtype<quant>, :min(1), :max(1), $qast) if $<wantarray>;
+        }
+        else {
+            $qast := QAST::Regex.new( $qast, :name($name),
+                    :rxtype<subcapture>, :node($/) );
+        }
+    }
+    else {
+        $qast := QAST::Regex.new( :rxtype<subrule>, :subtype<method>, :node($/),
+                QAST::NodeList.new(
+                        QAST::SVal.new( :value('!BACKREF') ),
+                        QAST::SVal.new( :value($name) ) ) );
+    }
+    make $qast;
+}
+
+
+
+
+
+method metachar:sym<assert>($/) {
+    make $<assertion>.ast;
+}
+
+method assertion ($/) {
+
+}
+
+
+
+
+#| Walks through a Match tree to determine what
+#| the index of the positional captures are
+sub walk-pos(Binex \b, \c = 0, $outer = True) is export {
+    return 0 if b.isa(BXLiteral);
+    return 0 if b.isa(BXAnchor);
+
+    # Outer ensures we don't get caught the second time around
+    if b.isa(BXCapture) && $outer {
+        b.position = c;
+        samewith b, 0, False;
+        return c + 1
+    }
+
+    my $count = c;
+    $count = samewith $_, $count, True
+        for b.children;
+    return $count;
 }
